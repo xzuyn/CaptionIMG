@@ -1,144 +1,274 @@
+from __future__ import annotations
+
+import logging
 import os
-import tkinter as tk
-from tkinter import filedialog
-from tkinter import messagebox
-from tkinter import Listbox
-from PIL import Image, ImageTk
 import re
+from pathlib import Path
+from typing import Iterable, List
 
-Image.MAX_IMAGE_PIXELS = None
+from PIL import Image, ImageOps
+from PIL.ImageQt import ImageQt
 
-def natural_sort(l):
-    convert = lambda text: int(text) if text.isdigit() else text.lower()
-    alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)] 
-    return sorted(l, key = alphanum_key)
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+    QStatusBar,
+)
 
-class CaptionIMG:
-    def __init__(self, root):
-        
-        self.root = root
-        screen_width = root.winfo_screenwidth()
-        screen_height = root.winfo_screenheight()
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-        #self.root.wm_attributes('-toolwindow', 'True')
-        self.root.title("CaptionIMG by ANTONIOPS")
-        self.root.geometry(f"{int(screen_width/1.5)}x{int(screen_height/1.5)}")
-        self.root.resizable(False,False)
-        
-        self.frame_list = tk.Frame(self.root)
-        self.frame_list.pack(side='left', fill='y')
-        
-        self.image_list = Listbox(self.frame_list, width=30)
-        
-        self.image_list.bind('<<ListboxSelect>>', self.load_image)
-        self.image_list.bind('<Control-s>', self.save)
-        
-        self.horizontal_scrollbar = tk.Scrollbar(self.frame_list, orient='horizontal')
-        self.horizontal_scrollbar.pack(side='bottom', fill='x')
-        self.horizontal_scrollbar.config(command=self.image_list.xview)
-        self.image_list.config(xscrollcommand=self.horizontal_scrollbar.set)
-        
-        self.vertical_scrollbar = tk.Scrollbar(self.frame_list, orient='vertical')
-        self.vertical_scrollbar.pack(side='right', fill='y')
-        self.vertical_scrollbar.config(command=self.image_list.yview)
-        self.image_list.config(yscrollcommand=self.vertical_scrollbar.set)
-        
-        self.image_list.pack(side='left', fill='both')
-        self.image_label = tk.Label(self.root)
-        self.image_label.pack(side='top', anchor='center')
-        self.image_label.pack_propagate(False)
-        
-        self.text_entry = tk.Text(self.root, height=6, width=85, wrap='word')
-        self.text_entry.config(borderwidth=5, relief="groove")
-        self.text_entry.pack(side='bottom', fill='both')
-        
-        self.save_button = tk.Button(self.root, text="Save Captions", command=self.save)
-        self.save_button.pack(side='bottom')
-        self.text_entry.bind('<Control-s>', self.save)
-        
-        self.open_button = tk.Button(self.root, text="Open Images", command=self.open_images)
-        self.open_button.pack(side='bottom')
-    
-    def open_images(self):
+
+def natural_sort(paths: Iterable[str]) -> List[str]:
+    """
+    Natural sort by basename (so file2 < file10).
+    """
+    def convert(text: str):
+        return int(text) if text.isdigit() else text.lower()
+
+    _re = re.compile(r"([0-9]+)")
+
+    def alphanum_key(p: str):
+        base = os.path.basename(p)
+        return [convert(c) for c in _re.split(base)]
+
+    return sorted(paths, key=alphanum_key)
+
+
+class CaptionIMGMain(QMainWindow):
+    SUPPORTED_EXT = (".bmp", ".jpg", ".jpeg", ".png", ".webp", ".tiff")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("CaptionIMG (PySide6)")
+        self.resize(1200, 800)
+
+        self.file_map: dict[str, Path] = {}
+        self.current_image_name: str | None = None
+        self.current_image_path: Path | None = None
+        self.unsaved = False
+
+        self._build_ui()
+        self._connect_shortcuts()
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QHBoxLayout()
+        central.setLayout(main_layout)
+
+        # Left: list
+        self.list_widget = QListWidget()
+        self.list_widget.setMinimumWidth(300)
+        main_layout.addWidget(self.list_widget, stretch=0)
+
+        # Right: image + caption area
+        right_v = QVBoxLayout()
+        main_layout.addLayout(right_v, stretch=1)
+
+        self.image_label = QLabel(alignment=Qt.AlignCenter)
+        self.image_label.setMinimumSize(400, 300)
+        self.image_label.setStyleSheet("border: 1px solid #999;")
+        right_v.addWidget(self.image_label, stretch=3)
+
+        self.caption_edit = QTextEdit()
+        self.caption_edit.setPlaceholderText("Enter image caption / description here...")
+        right_v.addWidget(self.caption_edit, stretch=1)
+
+        btn_row = QHBoxLayout()
+        self.open_btn = QPushButton("Open Images")
+        self.save_btn = QPushButton("Save Caption")
+        btn_row.addWidget(self.open_btn)
+        btn_row.addWidget(self.save_btn)
+        right_v.addLayout(btn_row)
+
+        # Status bar
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+        self.status.showMessage("No images loaded")
+
+        # Connections
+        self.open_btn.clicked.connect(self.open_images)
+        self.save_btn.clicked.connect(self.save_caption)
+        self.list_widget.currentItemChanged.connect(self._on_selection_changed)
+        self.caption_edit.textChanged.connect(self._on_text_changed)
+
+    def _connect_shortcuts(self) -> None:
+        # Ctrl+S to save
+        QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save_caption)
+        # Left/Right navigation
+        QShortcut(QKeySequence(Qt.Key_Left), self, activated=lambda: self._navigate(-1))
+        QShortcut(QKeySequence(Qt.Key_Right), self, activated=lambda: self._navigate(1))
+
+    def open_images(self) -> None:
         try:
-            file_types = "*.bmp *.jpg *.jpeg *.png"
-            file_paths = filedialog.askopenfilenames(filetypes=[("Common Image Files", file_types), ("All", "*.*")])
-            file_paths = natural_sort(file_paths)
-            if file_paths:
-                self.image_list.delete('0','end')
-                self.file_map = {}
-                for file_path in file_paths:
-                    file_name = os.path.basename(file_path)
-                    self.file_map[file_name] = file_path
-                    self.image_list.insert('end', file_name)
-        except:
-            pass
-    
-    def load_image(self, event):
-        try:
-            selection = self.image_list.curselection()
-            if not selection:
+            filters = "Images (*.bmp *.jpg *.jpeg *.png *.webp *.tiff);;All Files (*)"
+            selected, _ = QFileDialog.getOpenFileNames(self, "Select images", str(Path.home()), filters)
+            if not selected:
                 return
 
-            self.text_entry.delete(1.0, 'end')
-            index = selection[0]
-            file_name = self.image_list.get(index)
-            file_path = self.file_map[file_name]
-            self.current_image = file_name
-            self.current_image_path = file_path
-            
+            selected = natural_sort(selected)
+            self.file_map.clear()
+            self.list_widget.clear()
 
-            screen_width = root.winfo_screenwidth()
-            screen_height = root.winfo_screenheight()
+            for fp in selected:
+                p = Path(fp)
+                name = p.name
+                self.file_map[name] = p
+                self.list_widget.addItem(QListWidgetItem(name))
 
-            max_size = int(screen_width/2), int(screen_height/2.1)
+            self.status.showMessage(f"Loaded {len(selected)} image(s)")
+            if self.list_widget.count() > 0:
+                self.list_widget.setCurrentRow(0)
+        except Exception as exc:
+            logging.exception("Error while opening images")
+            QMessageBox.critical(self, "Error", f"Failed to open images:\n{exc}")
 
-            image = Image.open(file_path)
-
-            original_width, original_height = image.size
-            aspect_ratio = original_width / original_height
-            new_width, new_height = max_size
-
-            if original_width > original_height:
-                new_height = int(new_width / aspect_ratio)
-            else:
-                new_width = int(new_height * aspect_ratio)
-
-            if new_width > max_size[0]:
-                new_width = max_size[0]
-                new_height = int(new_width / aspect_ratio)
-            if new_height > max_size[1]:
-                new_height = max_size[1]
-                new_width = int(new_height * aspect_ratio)
-
-            image = image.resize((new_width, new_height), Image.LANCZOS)
-            image = ImageTk.PhotoImage(image)
-            self.image_label.config(image=image)
-            self.image_label.image = image
-            self.image_label.config(borderwidth=5, relief="groove")
-
-            description_file = str(self.current_image_path).rsplit('.', 1)[0] + ".txt"
-            
-            if os.path.isfile(description_file):
-                with open(description_file, "r") as file:
-                    description = file.read()
-                    self.text_entry.insert(1.0, description)
-            else:
-                self.text_entry.delete(1.0, 'end')
-        except:
-            pass
-
-    def save(self, event=None):
+    def _on_selection_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         try:
-            description = self.text_entry.get(1.0, 'end')
-            description_file = str(self.current_image_path).rsplit('.', 1)[0] + ".txt"
-            with open(description_file, "w") as file:
-                file.write(description)
-            messagebox.showinfo("Success", f"Captions saved successfully at {description_file}")
-        except:
-            messagebox.showinfo("Error", f"There was an error while saving the captions")
+            if previous and self.unsaved:
+                # Ask to save before switching
+                resp = QMessageBox.question(
+                    self,
+                    "Unsaved changes",
+                    "You have unsaved captions for the current image. Save before switching?",
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                )
+                if resp == QMessageBox.Cancel:
+                    # revert selection back to previous
+                    prev_row = self.list_widget.row(previous)
+                    self.list_widget.blockSignals(True)
+                    self.list_widget.setCurrentRow(prev_row)
+                    self.list_widget.blockSignals(False)
+                    return
+                elif resp == QMessageBox.Yes:
+                    if not self.save_caption():
+                        # If save failed, revert
+                        prev_row = self.list_widget.row(previous)
+                        self.list_widget.blockSignals(True)
+                        self.list_widget.setCurrentRow(prev_row)
+                        self.list_widget.blockSignals(False)
+                        return
+                else:
+                    # Discard changes
+                    self.unsaved = False
+
+            if not current:
+                self._clear_image_and_caption()
+                return
+
+            name = current.text()
+            path = self.file_map.get(name)
+            if not path:
+                return
+
+            self.current_image_name = name
+            self.current_image_path = path
+            self._display_image(path)
+            self._load_caption(path)
+            self.unsaved = False
+        except Exception:
+            logging.exception("Error on selection change")
+
+    def _display_image(self, path: Path) -> None:
+        try:
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im)
+                # scale to a reasonable size for display while preserving aspect
+                screen_size = QApplication.primaryScreen().size()
+                max_w = int(screen_size.width() * 0.5)
+                max_h = int(screen_size.height() * 0.5)
+                im.thumbnail((max_w, max_h), Image.LANCZOS)
+
+                qim = ImageQt(im)  # ImageQt returns a QImage compatible object
+                pix = QPixmap.fromImage(qim)
+
+                # Further scale to the label size while keeping aspect ratio
+                lbl_size = self.image_label.size()
+                if not lbl_size.isEmpty():
+                    pix = pix.scaled(lbl_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+                self.image_label.setPixmap(pix)
+                self.status.showMessage(f"{path.name} — {path}")
+        except Exception:
+            logging.exception("Unable to display image")
+            QMessageBox.warning(self, "Warning", f"Could not open image:\n{path}")
+
+    def _load_caption(self, path: Path) -> None:
+        caption_file = path.with_suffix(".txt")
+        if caption_file.exists():
+            try:
+                text = caption_file.read_text(encoding="utf-8")
+            except Exception:
+                logging.exception("Failed to read caption")
+                QMessageBox.warning(self, "Warning", f"Failed to read caption file:\n{caption_file}")
+                text = ""
+        else:
+            text = ""
+
+        self.caption_edit.blockSignals(True)
+        self.caption_edit.setPlainText(text)
+        self.caption_edit.blockSignals(False)
+        self.unsaved = False
+
+    def save_caption(self) -> bool:
+        """
+        Save current caption. Returns True on success.
+        """
+        if not self.current_image_path:
+            QMessageBox.information(self, "No image", "No image selected to save caption for.")
+            return False
+        caption_file = self.current_image_path.with_suffix(".txt")
+        text = self.caption_edit.toPlainText()
+        try:
+            caption_file.write_text(text, encoding="utf-8")
+            self.unsaved = False
+            QMessageBox.information(self, "Saved", f"Caption saved:\n{caption_file}")
+            return True
+        except Exception:
+            logging.exception("Failed to save caption")
+            QMessageBox.critical(self, "Error", "There was an error while saving the caption.")
+            return False
+
+    def _on_text_changed(self) -> None:
+        self.unsaved = True
+
+    def _navigate(self, step: int) -> None:
+        count = self.list_widget.count()
+        if count == 0:
+            return
+        current_row = self.list_widget.currentRow()
+        new_row = max(0, min(current_row + step, count - 1))
+        if new_row != current_row:
+            self.list_widget.setCurrentRow(new_row)
+
+    def _clear_image_and_caption(self) -> None:
+        self.image_label.clear()
+        self.caption_edit.clear()
+        self.current_image_name = None
+        self.current_image_path = None
+        self.status.showMessage("No image selected")
+        self.unsaved = False
 
 
-root = tk.Tk()
-app = CaptionIMG(root)
-root.mainloop()
+def main() -> None:
+    app = QApplication([])
+    win = CaptionIMGMain()
+    win.show()
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()
